@@ -1,0 +1,169 @@
+import os
+from typing import List, Dict, Any
+
+import praw
+from dotenv import load_dotenv
+from textblob import TextBlob
+
+
+def get_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value
+
+
+def analyze_sentiment(text: str) -> float:
+    """
+    Return sentiment polarity in range [-1.0, 1.0].
+    """
+    if not text or not text.strip():
+        return 0.0
+    return TextBlob(text).sentiment.polarity
+
+
+def classify_sentiment(score: float) -> str:
+    if score > 0.1:
+        return "positive"
+    if score < -0.1:
+        return "negative"
+    return "neutral"
+
+
+def create_reddit_client() -> praw.Reddit:
+    load_dotenv()
+
+    client_id = get_env("REDDIT_CLIENT_ID")
+    client_secret = get_env("REDDIT_CLIENT_SECRET")
+    user_agent = get_env("REDDIT_USER_AGENT")
+
+    return praw.Reddit(
+        client_id=client_id,
+        client_secret=client_secret,
+        user_agent=user_agent,
+    )
+
+
+def fetch_posts(
+    reddit: praw.Reddit,
+    subreddit_name: str,
+    limit: int = 5,
+    sort: str = "hot",
+) -> List[Any]:
+    subreddit = reddit.subreddit(subreddit_name)
+
+    if sort == "new":
+        return list(subreddit.new(limit=limit))
+    if sort == "top":
+        return list(subreddit.top(limit=limit, time_filter="day"))
+
+    return list(subreddit.hot(limit=limit))
+
+
+def extract_post_data(post: Any, comment_limit: int = 5) -> Dict[str, Any]:
+    post_text = f"{post.title}\n\n{post.selftext or ''}".strip()
+    post_sentiment = analyze_sentiment(post_text)
+
+    post.comments.replace_more(limit=0)
+    top_comments = post.comments[:comment_limit]
+
+    comment_data = []
+    comment_scores = []
+
+    for comment in top_comments:
+        body = getattr(comment, "body", "")
+        score = analyze_sentiment(body)
+        comment_scores.append(score)
+
+        comment_data.append(
+            {
+                "author": str(comment.author) if comment.author else "[deleted]",
+                "score": getattr(comment, "score", 0),
+                "body": body[:300],
+                "sentiment_score": round(score, 3),
+                "sentiment_label": classify_sentiment(score),
+            }
+        )
+
+    avg_comment_sentiment = (
+        sum(comment_scores) / len(comment_scores) if comment_scores else 0.0
+    )
+
+    return {
+        "id": post.id,
+        "subreddit": str(post.subreddit),
+        "title": post.title,
+        "selftext": post.selftext,
+        "author": str(post.author) if post.author else "[deleted]",
+        "score": post.score,
+        "num_comments": post.num_comments,
+        "url": post.url,
+        "permalink": f"https://www.reddit.com{post.permalink}",
+        "post_sentiment_score": round(post_sentiment, 3),
+        "post_sentiment_label": classify_sentiment(post_sentiment),
+        "avg_comment_sentiment_score": round(avg_comment_sentiment, 3),
+        "avg_comment_sentiment_label": classify_sentiment(avg_comment_sentiment),
+        "top_comments": comment_data,
+    }
+
+
+def print_report(posts_data: List[Dict[str, Any]]) -> None:
+    print("=" * 80)
+    print("REDDIT MARKET SENTIMENT REPORT")
+    print("=" * 80)
+
+    for i, post in enumerate(posts_data, start=1):
+        print(f"\n[{i}] {post['title']}")
+        print(f"Subreddit: r/{post['subreddit']}")
+        print(f"Author: {post['author']}")
+        print(f"Score: {post['score']} | Comments: {post['num_comments']}")
+        print(f"Post Sentiment: {post['post_sentiment_score']} ({post['post_sentiment_label']})")
+        print(
+            f"Avg Top Comment Sentiment: {post['avg_comment_sentiment_score']} "
+            f"({post['avg_comment_sentiment_label']})"
+        )
+        print(f"Link: {post['permalink']}")
+
+        if post["top_comments"]:
+            print("Top comments:")
+            for j, comment in enumerate(post["top_comments"], start=1):
+                print(
+                    f"  - ({j}) {comment['author']} | "
+                    f"score={comment['score']} | "
+                    f"sentiment={comment['sentiment_score']} ({comment['sentiment_label']})"
+                )
+                print(f"    {comment['body']}")
+        else:
+            print("Top comments: none")
+
+        print("-" * 80)
+
+
+def main() -> None:
+    try:
+        reddit = create_reddit_client()
+    except ValueError as exc:
+        print(f"Configuration error: {exc}")
+        return
+
+    subreddits = ["stocks", "investing", "wallstreetbets"]
+    all_posts_data: List[Dict[str, Any]] = []
+
+    for subreddit_name in subreddits:
+        try:
+            posts = fetch_posts(reddit, subreddit_name, limit=2, sort="hot")
+            for post in posts:
+                post_data = extract_post_data(post, comment_limit=3)
+                all_posts_data.append(post_data)
+        except Exception as exc:
+            print(f"Failed to fetch data from r/{subreddit_name}: {exc}")
+
+    if not all_posts_data:
+        print("No posts fetched.")
+        return
+
+    print_report(all_posts_data)
+
+
+if __name__ == "__main__":
+    main()
